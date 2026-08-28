@@ -1,0 +1,4 @@
+touchmap
+*.o
+*.dSYM/
+.DS_Store
