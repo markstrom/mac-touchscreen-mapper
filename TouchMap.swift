@@ -319,9 +319,18 @@ if optStatus {
         : ok("running (pid \(pids.map(String.init).joined(separator: " ")))")
 
     // Permissions apply to the binary being executed, so say which one that is.
-    let self_ = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
-    if self_ != INSTALL_PATH {
-        warn("checking THIS copy (\(self_)), not the installed one.")
+    //
+    // Not from argv[0]: invoked through PATH that is the bare command name, and
+    // URL(fileURLWithPath:) then resolves it against the working directory. The
+    // check reported paths that did not exist and warned about the installed
+    // binary while running it — from the very invocation the README recommends.
+    // Bundle.main.executablePath is the actual image path in both cases.
+    let selfPath = (Bundle.main.executablePath.map {
+        URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
+    }) ?? INSTALL_PATH
+    let installed = URL(fileURLWithPath: INSTALL_PATH).resolvingSymlinksInPath().path
+    if selfPath != installed {
+        warn("checking THIS copy (\(selfPath)), not the installed one.")
         warn("permissions are per-binary — run '\(INSTALL_PATH) --status' for the real answer.")
     }
 
