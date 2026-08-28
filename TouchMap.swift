@@ -1,0 +1,524 @@
+// touchmap — map a USB HID touchscreen to the display it is actually attached to.
+//
+// macOS has no touchscreen support. A USB touch panel enumerates as a HID device
+// reporting absolute coordinates, and macOS maps those coordinates onto whichever
+// display currently holds the cursor. Touching an external panel therefore clicks
+// somewhere on your laptop screen instead.
+//
+// This tool seizes the panel, converts its absolute coordinates against the target
+// display's real global bounds, and posts its own mouse events there.
+
+import Foundation
+import IOKit
+import IOKit.hid
+import CoreGraphics
+import ColorSync
+
+// HID usage constants.
+let kUsagePageGD        = 0x01   // Generic Desktop
+let kUsagePageButton    = 0x09
+let kUsagePageDigitizer = 0x0D
+let kUsageX             = 0x30
+let kUsageY             = 0x31
+let kUsageTipSwitch     = 0x42
+let kUsageTouchScreen   = 0x04
+
+// ── Options ──────────────────────────────────────────────────────────────────
+var optSeize        = true
+var optVerbose      = false
+var optDebug        = false
+var optMultitouch   = false
+var optProbeModes   = false
+var optInvertScroll = false
+var optScrollScale  = 1.0
+var optHoldTime     = 0.5
+var optDisplayUUID: String? = nil
+var optVendor: Int? = nil
+var optProduct: Int? = nil
+var optListDisplays = false
+var optListDevices  = false
+
+func parseID(_ s: String?) -> Int? {
+    guard let s = s else { return nil }
+    if s.hasPrefix("0x") || s.hasPrefix("0X") { return Int(s.dropFirst(2), radix: 16) }
+    return Int(s)
+}
+
+var argIt = CommandLine.arguments.dropFirst().makeIterator()
+while let a = argIt.next() {
+    switch a {
+    case "--no-seize":      optSeize = false
+    case "-v", "--verbose": optVerbose = true
+    case "--debug":         optDebug = true; optVerbose = true
+    case "--multitouch":    optMultitouch = true
+    case "--probe-modes":   optProbeModes = true; optMultitouch = true
+    case "--invert-scroll": optInvertScroll = true
+    case "--scroll-scale":  optScrollScale = Double(argIt.next() ?? "1") ?? 1.0
+    case "--hold-time":     optHoldTime = Double(argIt.next() ?? "0.5") ?? 0.5
+    case "--display":       optDisplayUUID = argIt.next()
+    case "--vendor":        optVendor = parseID(argIt.next())
+    case "--product":       optProduct = parseID(argIt.next())
+    case "--list-displays": optListDisplays = true
+    case "--list-devices":  optListDevices = true
+    case "-h", "--help":
+        print("""
+        touchmap — map a USB HID touchscreen to the display it belongs to
+
+        USAGE
+          touchmap [options]
+
+        DEVICE
+          --list-devices      List touchscreen-capable HID devices and exit
+          --vendor <id>       Vendor ID (decimal or 0x hex). Default: auto-detect
+          --product <id>      Product ID. Default: auto-detect
+
+        DISPLAY
+          --list-displays     List connected displays and exit
+          --display <uuid>    Target display UUID. Default: first external display
+
+        GESTURES
+          --hold-time <sec>   Hold duration before a press becomes scroll (0.5)
+          --scroll-scale <n>  Scroll speed multiplier (1.0)
+          --invert-scroll     Reverse scroll direction
+
+        DIAGNOSTICS
+          -v, --verbose       Log interpreted gestures
+          --debug             Log every HID report and element
+          --no-seize          Do not take exclusive control of the device
+          --multitouch        Try to switch the panel into multitouch mode
+          --probe-modes       Write every Device Mode value and read each back
+        """)
+        exit(0)
+    default:
+        FileHandle.standardError.write("unknown argument: \(a)\n".data(using: .utf8)!)
+        exit(2)
+    }
+}
+
+func log(_ s: String) { print(s); fflush(stdout) }
+func die(_ s: String) -> Never {
+    FileHandle.standardError.write("error: \(s)\n".data(using: .utf8)!); exit(1)
+}
+func hexRC(_ r: IOReturn) -> String { String(format: "0x%08X", UInt32(bitPattern: r)) }
+
+// ── Displays ─────────────────────────────────────────────────────────────────
+func displayUUID(_ id: CGDirectDisplayID) -> String? {
+    guard let ref = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
+    return CFUUIDCreateString(nil, ref) as String?
+}
+
+func onlineDisplays() -> [CGDirectDisplayID] {
+    var count: UInt32 = 0
+    CGGetOnlineDisplayList(0, nil, &count)
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    CGGetOnlineDisplayList(count, &ids, &count)
+    return Array(ids.prefix(Int(count)))
+}
+
+if optListDisplays {
+    for id in onlineDisplays() {
+        let b = CGDisplayBounds(id)
+        let builtin = CGDisplayIsBuiltin(id) != 0 ? "  [built-in]" : ""
+        log("\(displayUUID(id) ?? "?")  \(Int(b.width))x\(Int(b.height)) @ (\(Int(b.minX)),\(Int(b.minY)))\(builtin)")
+    }
+    exit(0)
+}
+
+func resolveTarget() -> CGDirectDisplayID? {
+    let all = onlineDisplays()
+    if let want = optDisplayUUID {
+        return all.first { displayUUID($0)?.caseInsensitiveCompare(want) == .orderedSame }
+    }
+    return all.first { CGDisplayIsBuiltin($0) == 0 }
+}
+
+final class Target {
+    private(set) var bounds: CGRect = .zero
+    private(set) var ok = false
+    func refresh() {
+        if let id = resolveTarget() {
+            bounds = CGDisplayBounds(id); ok = true
+            log("display: \(displayUUID(id) ?? "?")  \(Int(bounds.width))x\(Int(bounds.height)) @ (\(Int(bounds.minX)),\(Int(bounds.minY)))")
+        } else {
+            ok = false
+            log("display: not found — touches ignored until it is connected")
+        }
+    }
+}
+let target = Target()
+
+// ── Device discovery ─────────────────────────────────────────────────────────
+struct DeviceID { let vendor: Int; let product: Int; let name: String }
+
+func deviceProp(_ d: IOHIDDevice, _ key: String) -> Int {
+    (IOHIDDeviceGetProperty(d, key as CFString) as? Int) ?? -1
+}
+
+/// Any HID device whose primary usage says "touch screen". That is the class of
+/// panel this tool targets: the Windows-style USB HID digitizer.
+func findTouchDevices() -> [DeviceID] {
+    let m = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    IOHIDManagerSetDeviceMatching(m, [
+        kIOHIDPrimaryUsagePageKey: kUsagePageDigitizer,
+        kIOHIDPrimaryUsageKey: kUsageTouchScreen,
+    ] as CFDictionary)
+    guard let set = IOHIDManagerCopyDevices(m) as? Set<IOHIDDevice> else { return [] }
+
+    var seen = Set<String>()
+    var out: [DeviceID] = []
+    for d in set {
+        let v = deviceProp(d, kIOHIDVendorIDKey), p = deviceProp(d, kIOHIDProductIDKey)
+        guard v > 0, p >= 0 else { continue }
+        let key = "\(v):\(p)"
+        if seen.insert(key).inserted {
+            let name = (IOHIDDeviceGetProperty(d, kIOHIDProductKey as CFString) as? String) ?? "unnamed"
+            out.append(DeviceID(vendor: v, product: p, name: name))
+        }
+    }
+    return out.sorted { $0.vendor == $1.vendor ? $0.product < $1.product : $0.vendor < $1.vendor }
+}
+
+if optListDevices {
+    let found = findTouchDevices()
+    if found.isEmpty {
+        log("no touchscreen HID devices found")
+        log("(a panel must expose usage page 0x0D usage 0x04 — check it is plugged in)")
+    }
+    for d in found {
+        log(String(format: "vendor 0x%04X  product 0x%04X  %@", d.vendor, d.product, d.name))
+    }
+    exit(0)
+}
+
+// Resolve which panel to drive: explicit flags win, otherwise auto-detect.
+let deviceID: DeviceID
+if let v = optVendor, let p = optProduct {
+    deviceID = DeviceID(vendor: v, product: p, name: "specified on command line")
+} else {
+    let found = findTouchDevices()
+    guard let first = found.first else {
+        die("""
+            no touchscreen found.
+            Run with --list-devices to see what is connected, and pass
+            --vendor/--product if your panel is not detected automatically.
+            """)
+    }
+    if found.count > 1 {
+        log("note: \(found.count) touchscreens found, using the first — override with --vendor/--product")
+    }
+    deviceID = first
+}
+log(String(format: "device: %@ (vendor 0x%04X, product 0x%04X)",
+           deviceID.name, deviceID.vendor, deviceID.product))
+
+target.refresh()
+
+CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
+    if flags.contains(.setModeFlag) || flags.contains(.addFlag)
+        || flags.contains(.removeFlag) || flags.contains(.desktopShapeChangedFlag) {
+        target.refresh()
+    }
+}, nil)
+
+// ── Gesture state ────────────────────────────────────────────────────────────
+// A panel may deliver on either of two paths depending on its mode:
+//   Mouse collection      button 1 + absolute X/Y   (mouse emulation)
+//   Digitizer collection  TipSwitch + absolute X/Y  (per finger)
+// Both are treated the same way: one "contact" per HID collection.
+struct Contact {
+    var x = 0, y = 0
+    var xMax = 0, yMax = 0
+    var down = false
+    var hasPos: Bool { xMax > 0 && yMax > 0 }
+}
+var contacts: [UInt32: Contact] = [:]
+
+enum Phase { case idle, pending, dragging, scrolling }
+var phase: Phase = .idle
+
+var lastPt = CGPoint.zero        // latest finger position, global coordinates
+var touchStart = CGPoint.zero    // where the finger first landed
+var touchStartAt: TimeInterval = 0
+var scrollAnchor = CGPoint.zero  // point we last scrolled from
+var lastUpPt = CGPoint.zero
+var lastDownAt: TimeInterval = 0
+var clickState = 1
+
+let MOVE_SLOP = 8.0              // how far a finger may drift and still count as still
+
+func nowTS() -> TimeInterval { Date().timeIntervalSince1970 }
+
+func post(_ type: CGEventType, _ p: CGPoint) {
+    guard let e = CGEvent(mouseEventSource: nil, mouseType: type,
+                          mouseCursorPosition: p, mouseButton: .left) else { return }
+    e.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+    e.post(tap: .cghidEventTap)
+}
+
+func postScroll(_ dx: Double, _ dy: Double) {
+    let sign = optInvertScroll ? -1.0 : 1.0
+    let vy = Int32((sign * dy * optScrollScale).rounded())
+    let vx = Int32((sign * dx * optScrollScale).rounded())
+    guard vx != 0 || vy != 0 else { return }
+    guard let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                          wheelCount: 2, wheel1: vy, wheel2: vx, wheel3: 0) else { return }
+    e.post(tap: .cghidEventTap)
+    if optVerbose { log("scroll \(vx),\(vy)") }
+}
+
+func updateClickState(_ p: CGPoint) {
+    let t = nowTS()
+    let near = hypot(p.x - lastUpPt.x, p.y - lastUpPt.y) < 12
+    clickState = (t - lastDownAt < 0.45 && near) ? min(clickState + 1, 3) : 1
+    lastDownAt = t
+}
+
+/// Called every 50 ms. A finger held still produces no value changes and therefore
+/// no HID callbacks, so the transition into scroll mode has to be timer-driven.
+func checkHold() {
+    guard phase == .pending,
+          nowTS() - touchStartAt >= optHoldTime,
+          hypot(lastPt.x - touchStart.x, lastPt.y - touchStart.y) <= MOVE_SLOP
+    else { return }
+    // The button has been down since touch-down; release it before scrolling.
+    post(.leftMouseUp, lastPt)
+    lastUpPt = lastPt
+    phase = .scrolling
+    scrollAnchor = lastPt
+    if optVerbose { log("scroll mode  \(Int(lastPt.x)),\(Int(lastPt.y))") }
+}
+
+func emit() {
+    guard target.ok else { return }
+    let b = target.bounds
+
+    let downs = contacts.values.filter { $0.down && $0.hasPos }
+
+    // ── All fingers lifted ───────────────────────────────────────────────────
+    if downs.isEmpty {
+        switch phase {
+        case .pending, .dragging:
+            post(.leftMouseUp, lastPt)
+            lastUpPt = lastPt
+            if optVerbose { log("up    \(Int(lastPt.x)),\(Int(lastPt.y))") }
+        case .scrolling, .idle:
+            break   // button was already released when scroll mode engaged
+        }
+        phase = .idle
+        return
+    }
+
+    // ── Two or more fingers: scroll directly ─────────────────────────────────
+    // Panels stuck in mouse emulation never report more than one contact, but
+    // this branch costs nothing and is correct for hardware that does.
+    if downs.count >= 2 {
+        if phase == .dragging || phase == .pending { post(.leftMouseUp, lastPt) }
+        let cx = downs.map { Double($0.x) / Double($0.xMax) }.reduce(0, +) / Double(downs.count)
+        let cy = downs.map { Double($0.y) / Double($0.yMax) }.reduce(0, +) / Double(downs.count)
+        let p = CGPoint(x: b.minX + cx * b.width, y: b.minY + cy * b.height)
+        if phase == .scrolling { postScroll(p.x - scrollAnchor.x, p.y - scrollAnchor.y) }
+        phase = .scrolling
+        scrollAnchor = p
+        lastPt = p
+        return
+    }
+
+    // ── One finger ───────────────────────────────────────────────────────────
+    guard let c = downs.first else { return }
+    let p = CGPoint(x: b.minX + (Double(c.x) / Double(c.xMax)) * b.width,
+                    y: b.minY + (Double(c.y) / Double(c.yMax)) * b.height)
+
+    switch phase {
+    case .idle:
+        // Press the button on touch-down. Deferring it to lift-off produced a
+        // zero-duration click that applications silently ignored.
+        phase = .pending
+        touchStart = p
+        touchStartAt = nowTS()
+        lastPt = p
+        updateClickState(p)
+        post(.leftMouseDown, p)
+        if optVerbose { log("down  \(Int(p.x)),\(Int(p.y))  click=\(clickState)") }
+
+    case .pending:
+        lastPt = p
+        if hypot(p.x - touchStart.x, p.y - touchStart.y) > MOVE_SLOP {
+            phase = .dragging
+            post(.leftMouseDragged, p)
+            if optVerbose { log("drag  \(Int(p.x)),\(Int(p.y))") }
+        } else {
+            post(.leftMouseDragged, p)
+        }
+
+    case .dragging:
+        lastPt = p
+        post(.leftMouseDragged, p)
+
+    case .scrolling:
+        lastPt = p
+        postScroll(p.x - scrollAnchor.x, p.y - scrollAnchor.y)
+        scrollAnchor = p
+    }
+}
+
+// ── HID ──────────────────────────────────────────────────────────────────────
+let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+
+// Match ALL collections on the device. A panel in mouse-emulation mode delivers
+// on the Mouse collection, not the digitizer one.
+IOHIDManagerSetDeviceMatching(manager, [
+    kIOHIDVendorIDKey: deviceID.vendor,
+    kIOHIDProductIDKey: deviceID.product,
+] as CFDictionary)
+
+// Windows Digitizer "Device Configuration": report ID 33 = { Device Mode, Device Index }.
+// Mode 2 requests multitouch. Many cheap controllers acknowledge the write and
+// then ignore it — use --probe-modes to find out whether yours stores anything.
+func readDeviceMode(_ device: IOHIDDevice) -> String {
+    var back = [UInt8](repeating: 0, count: 8)
+    var len = back.count
+    let g = IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 33, &back, &len)
+    guard g == kIOReturnSuccess else { return "read failed \(hexRC(g))" }
+    return back.prefix(max(len, 1)).map { String($0) }.joined(separator: ",")
+}
+
+@discardableResult
+func setDeviceMode(_ device: IOHIDDevice, _ mode: UInt8) -> IOReturn {
+    var withoutID: [UInt8] = [mode, 0x00]
+    var r = IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 33, &withoutID, withoutID.count)
+    if r != kIOReturnSuccess {
+        var withID: [UInt8] = [33, mode, 0x00]
+        r = IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 33, &withID, withID.count)
+    }
+    return r
+}
+
+func probeModes(_ device: IOHIDDevice) {
+    log("  Device Mode before: \(readDeviceMode(device))")
+    for mode in [UInt8(0), 1, 2, 3] {
+        let r = setDeviceMode(device, mode)
+        log("  wrote mode \(mode): \(hexRC(r)) → reads back: \(readDeviceMode(device))")
+    }
+    setDeviceMode(device, 2)
+    log("  restored to mode 2")
+}
+
+let valueCallback: IOHIDValueCallback = { _, _, _, value in
+    let el = IOHIDValueGetElement(value)
+    let page = Int(IOHIDElementGetUsagePage(el))
+    let usage = Int(IOHIDElementGetUsage(el))
+    let v = Int(IOHIDValueGetIntegerValue(value))
+
+    if optDebug {
+        let pc = IOHIDElementGetParent(el).map { String(IOHIDElementGetCookie($0)) } ?? "nil"
+        log(String(format: "  val page=0x%02X usage=0x%02X val=%d parent=%@", page, usage, v, pc))
+    }
+
+    // Group by parent collection: one finger, or the mouse collection.
+    guard let parent = IOHIDElementGetParent(el) else { return }
+    let key = IOHIDElementGetCookie(parent)
+    var c = contacts[key] ?? Contact()
+
+    switch (page, usage) {
+    // Contact down: TipSwitch (digitizer) or button 1 (mouse emulation).
+    case (kUsagePageDigitizer, kUsageTipSwitch), (kUsagePageButton, 0x01):
+        c.down = (v != 0)
+        contacts[key] = c
+        emit()
+
+    case (kUsagePageGD, kUsageX):
+        if IOHIDElementIsRelative(el) { return }   // a real relative mouse, not our panel
+        c.x = v
+        c.xMax = Int(IOHIDElementGetLogicalMax(el))
+        contacts[key] = c
+        if c.down { emit() }
+
+    case (kUsagePageGD, kUsageY):
+        if IOHIDElementIsRelative(el) { return }
+        c.y = v
+        c.yMax = Int(IOHIDElementGetLogicalMax(el))
+        contacts[key] = c
+        if c.down { emit() }
+
+    default:
+        return
+    }
+}
+
+IOHIDManagerRegisterInputValueCallback(manager, valueCallback, nil)
+
+var rawBufs: [UnsafeMutablePointer<UInt8>] = []
+
+IOHIDManagerRegisterDeviceMatchingCallback(manager, { _, _, _, device in
+    let page = deviceProp(device, kIOHIDPrimaryUsagePageKey)
+    let usage = deviceProp(device, kIOHIDPrimaryUsageKey)
+    let name: String
+    switch (page, usage) {
+    case (0x01, 0x02): name = "Mouse"
+    case (0x0D, 0x04): name = "TouchScreen digitizer"
+    default:           name = "vendor/other"
+    }
+    log(String(format: "collection: %@ (page=0x%02X usage=0x%02X)", name, page, usage))
+
+    if page == kUsagePageDigitizer {
+        if optProbeModes {
+            probeModes(device)
+        } else if optMultitouch {
+            let r = setDeviceMode(device, 2)
+            log(r == kIOReturnSuccess
+                ? "  multitouch requested (Device Mode = 2), stored value: \(readDeviceMode(device))"
+                : "  could not set Device Mode (\(hexRC(r)))")
+        }
+    }
+
+    if optDebug {
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 1024)
+        rawBufs.append(buf)
+        IOHIDDeviceRegisterInputReportCallback(device, buf, 1024, { _, _, _, _, reportID, report, length in
+            var hex = ""
+            for i in 0..<min(Int(length), 24) { hex += String(format: "%02X ", report[i]) }
+            log("  raw id=\(reportID) len=\(length): \(hex)")
+        }, nil)
+    }
+}, nil)
+
+IOHIDManagerRegisterDeviceRemovalCallback(manager, { _, _, _, _ in
+    log("touch panel disconnected")
+    if phase == .dragging || phase == .pending { post(.leftMouseUp, lastPt) }
+    contacts.removeAll()
+    phase = .idle
+}, nil)
+
+IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+
+let rc = IOHIDManagerOpen(manager, IOOptionBits(optSeize ? kIOHIDOptionsTypeSeizeDevice
+                                                         : kIOHIDOptionsTypeNone))
+if rc != kIOReturnSuccess {
+    if UInt32(bitPattern: rc) == 0xE00002C5 {
+        die("""
+            device is already held exclusively by another process (\(hexRC(rc))).
+            An earlier touchmap is probably still running:
+                pkill -x touchmap
+            """)
+    }
+    if optSeize {
+        log("warning: could not take exclusive control (\(hexRC(rc))) — falling back to shared mode.")
+        if IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) != kIOReturnSuccess {
+            die("could not open the HID device. Grant Input Monitoring in System Settings.")
+        }
+    } else {
+        die("could not open the HID device (\(hexRC(rc))).")
+    }
+} else if optSeize {
+    log("exclusive control of the touch panel — macOS's own mapping is disabled")
+}
+
+signal(SIGINT)  { _ in IOHIDManagerClose(manager, 0); exit(0) }
+signal(SIGTERM) { _ in IOHIDManagerClose(manager, 0); exit(0) }
+
+let holdTimer = CFRunLoopTimerCreateWithHandler(
+    kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.05, 0.05, 0, 0) { _ in checkHold() }
+CFRunLoopAddTimer(CFRunLoopGetCurrent(), holdTimer, .defaultMode)
+
+log("touchmap running. Ctrl-C to stop.")
+CFRunLoopRun()
