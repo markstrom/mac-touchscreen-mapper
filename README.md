@@ -1,7 +1,6 @@
 # mac-touchscreen-mapper
 
-**You connected an external touchscreen to your Mac. The picture works. The touch
-doesn't.**
+## You connected an external touchscreen to your Mac. The picture works. The touch doesn't.
 
 You tap a button on the touch panel and nothing happens there — instead something
 gets clicked over on your laptop screen, in roughly the same spot. Drag a finger
