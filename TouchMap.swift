@@ -40,7 +40,7 @@ var optListDisplays = false
 var optListDevices  = false
 var optStatus       = false
 
-let VERSION      = "1.0.0"
+let VERSION      = "1.1.0"
 let INSTALL_PATH = "/usr/local/bin/touchmap"
 let AGENT_LABEL  = "io.github.markstrom.touchmap"
 
