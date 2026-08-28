@@ -439,6 +439,21 @@ Press Ctrl-C to stop, then start the agent again:
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/io.github.markstrom.touchmap.plist
 ```
 
+## What it cannot do
+
+- **Unlock the Mac.** The panel is seized while the tool runs, so the lock screen
+  never sees touch. Use the keyboard or trackpad to log back in.
+- **Serve a second user.** The tool belongs to one login session and keeps the
+  panel while that session is switched away, so another user gets nothing from it.
+- **Two-finger gestures**, on panels that ignore the mode switch — which is most of
+  them. Hold-and-drag replaces scrolling. No pinch, no rotate.
+- **Hover.** The panel reports nothing until you touch it, so the cursor jumps
+  rather than tracking an approaching finger.
+- **Right-click.** Nothing is mapped to a secondary button; a long press is taken
+  by the scroll gesture.
+- **Rotated displays.** The mapping assumes an unrotated target. Mirroring is
+  untested.
+
 ## Pinning a display
 
 With one external screen, auto-detection is right and there is nothing to do. With

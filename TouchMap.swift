@@ -398,9 +398,25 @@ CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
 // Both are treated the same way: one "contact" per HID collection.
 struct Contact {
     var x = 0, y = 0
-    var xMax = 0, yMax = 0
+    var xMin = 0, xMax = 0
+    var yMin = 0, yMax = 0
     var down = false
-    var hasPos: Bool { xMax > 0 && yMax > 0 }
+    var fromDigitizer = false   // digitizer collection, as opposed to mouse emulation
+
+    var hasPos: Bool { xMax > xMin && yMax > yMin }
+
+    /// Position as a 0...1 fraction of the panel surface.
+    ///
+    /// Logical minimum is not always zero — the reference panel reports 0..16383
+    /// but the HID spec does not require it, and assuming zero silently maps every
+    /// touch to the wrong place on hardware that does otherwise. Clamped because a
+    /// controller reporting slightly past its declared maximum near the bezel
+    /// would otherwise place the cursor outside the target display entirely.
+    var fraction: (x: Double, y: Double) {
+        let fx = Double(x - xMin) / Double(xMax - xMin)
+        let fy = Double(y - yMin) / Double(yMax - yMin)
+        return (Swift.min(Swift.max(fx, 0), 1), Swift.min(Swift.max(fy, 0), 1))
+    }
 }
 var contacts: [UInt32: Contact] = [:]
 
@@ -461,7 +477,15 @@ func checkHold() {
 }
 
 func emit() {
-    let downs = contacts.values.filter { $0.down && $0.hasPos }
+    var downs = contacts.values.filter { $0.down && $0.hasPos }
+
+    // A panel switched into multitouch mode reports the same finger on both the
+    // digitizer and its mouse-emulation collection. Counting both would make one
+    // finger look like two and silently turn every tap into a scroll. The
+    // digitizer wins whenever it is speaking.
+    if downs.contains(where: { $0.fromDigitizer }) {
+        downs = downs.filter { $0.fromDigitizer }
+    }
 
     // ── All fingers lifted ───────────────────────────────────────────────────
     // Releasing works off lastPt, so it needs no bounds at all.
@@ -490,8 +514,8 @@ func emit() {
     // this branch costs nothing and is correct for hardware that does.
     if downs.count >= 2 {
         if phase == .dragging || phase == .pending { post(.leftMouseUp, lastPt) }
-        let cx = downs.map { Double($0.x) / Double($0.xMax) }.reduce(0, +) / Double(downs.count)
-        let cy = downs.map { Double($0.y) / Double($0.yMax) }.reduce(0, +) / Double(downs.count)
+        let cx = downs.map { $0.fraction.x }.reduce(0, +) / Double(downs.count)
+        let cy = downs.map { $0.fraction.y }.reduce(0, +) / Double(downs.count)
         let p = CGPoint(x: b.minX + cx * b.width, y: b.minY + cy * b.height)
         if phase == .scrolling { postScroll(p.x - scrollAnchor.x, p.y - scrollAnchor.y) }
         phase = .scrolling
@@ -502,8 +526,8 @@ func emit() {
 
     // ── One finger ───────────────────────────────────────────────────────────
     guard let c = downs.first else { return }
-    let p = CGPoint(x: b.minX + (Double(c.x) / Double(c.xMax)) * b.width,
-                    y: b.minY + (Double(c.y) / Double(c.yMax)) * b.height)
+    let f = c.fraction
+    let p = CGPoint(x: b.minX + f.x * b.width, y: b.minY + f.y * b.height)
 
     switch phase {
     case .idle:
@@ -601,12 +625,14 @@ let valueCallback: IOHIDValueCallback = { _, _, _, value in
     // Contact down: TipSwitch (digitizer) or button 1 (mouse emulation).
     case (kUsagePageDigitizer, kUsageTipSwitch), (kUsagePageButton, 0x01):
         c.down = (v != 0)
+        if page == kUsagePageDigitizer { c.fromDigitizer = true }
         contacts[key] = c
         emit()
 
     case (kUsagePageGD, kUsageX):
         if IOHIDElementIsRelative(el) { return }   // a real relative mouse, not our panel
         c.x = v
+        c.xMin = Int(IOHIDElementGetLogicalMin(el))
         c.xMax = Int(IOHIDElementGetLogicalMax(el))
         contacts[key] = c
         if c.down { emit() }
@@ -614,6 +640,7 @@ let valueCallback: IOHIDValueCallback = { _, _, _, value in
     case (kUsagePageGD, kUsageY):
         if IOHIDElementIsRelative(el) { return }
         c.y = v
+        c.yMin = Int(IOHIDElementGetLogicalMin(el))
         c.yMax = Int(IOHIDElementGetLogicalMax(el))
         contacts[key] = c
         if c.down { emit() }
@@ -680,10 +707,30 @@ if rc != kIOReturnSuccess {
             """)
     }
     if optSeize {
-        log("warning: could not take exclusive control (\(hexRC(rc))) — falling back to shared mode.")
-        if IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) != kIOReturnSuccess {
-            die("could not open the HID device. Grant Input Monitoring in System Settings.")
-        }
+        // Falling back to shared mode here was a mistake. Without exclusive
+        // control macOS keeps mapping the panel its own wrong way *while* this
+        // process posts corrected events, so every touch clicks twice, in two
+        // different places. That is worse than not running, and it looks like the
+        // tool is broken rather than unpermitted.
+        //
+        // Exiting is also the better failure: launchd restarts the agent, so the
+        // moment Input Monitoring is granted it simply starts working, with no
+        // kickstart needed.
+        die("""
+            could not take exclusive control of the panel (\(hexRC(rc))).
+
+            This is almost always a missing Input Monitoring grant. Add the binary
+            and the agent will pick it up by itself:
+
+                open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+
+            then add \(INSTALL_PATH), and enable the switch.
+
+            Running without exclusive control is deliberately not offered: macOS
+            would keep mapping the panel to the wrong display while this process
+            posts corrected events, so every touch would click twice, in two
+            places. Pass --no-seize if you want that anyway, for diagnostics.
+            """)
     } else {
         die("could not open the HID device (\(hexRC(rc))).")
     }
@@ -691,8 +738,29 @@ if rc != kIOReturnSuccess {
     log("exclusive control of the touch panel — macOS's own mapping is disabled")
 }
 
-signal(SIGINT)  { _ in IOHIDManagerClose(manager, 0); exit(0) }
-signal(SIGTERM) { _ in IOHIDManagerClose(manager, 0); exit(0) }
+// Releasing the button on the way out is not optional. The documented upgrade
+// path ends in `launchctl kickstart -k`, which sends SIGTERM — and if a finger
+// happens to be on the panel at that moment, leftMouseDown has been posted and
+// never matched. The left button then stays down system-wide, dragging everything
+// the user touches, and only a physical click clears it.
+//
+// A C signal handler may not call CGEvent. A dispatch signal source delivers on
+// the main queue instead, which the run loop drains, so the shutdown runs as
+// ordinary code.
+func shutdown() -> Never {
+    if phase == .pending || phase == .dragging { post(.leftMouseUp, lastPt) }
+    IOHIDManagerClose(manager, 0)
+    exit(0)
+}
+
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGINT, SIGTERM] {
+    signal(sig, SIG_IGN)   // the dispatch source handles it instead
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler { shutdown() }
+    src.resume()
+    signalSources.append(src)
+}
 
 let holdTimer = CFRunLoopTimerCreateWithHandler(
     kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.05, 0.05, 0, 0) { _ in checkHold() }

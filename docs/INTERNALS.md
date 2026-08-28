@@ -418,3 +418,49 @@ leave the machine with no pointing device.
   not be what you want to map against.
 - **A long press emits a click** before scrolling. Harmless in practice, but visible
   in applications that act on a single click.
+- **The lock screen gets no touch input.** The panel is seized, so macOS never sees
+  it, and posting events into a locked session is blocked anyway. Unlocking needs
+  the keyboard or trackpad. Reasoned from how seizing and TCC work, not measured.
+- **Fast user switching.** The agent belongs to one login session and keeps the
+  device seized while that session is switched away, so another user's session
+  gets nothing from the panel.
+
+## Failure modes worth knowing
+
+Found by audit rather than by hitting them, and fixed — recorded because each one
+would have looked like something else entirely.
+
+**A stuck mouse button on shutdown.** `leftMouseDown` is posted at touch-down. If
+the process exits between that and the matching `up`, the left button stays down
+system-wide and everything the user touches afterwards gets dragged. The documented
+upgrade path ends in `launchctl kickstart -k`, which sends SIGTERM — so a finger on
+the panel during an upgrade was enough to trigger it. Shutdown now releases the
+button first. A C signal handler may not call CGEvent, so the signal is taken by a
+`DispatchSource` on the main queue, which the run loop drains.
+
+Worth checking after any change: SIGTERM must still terminate the process.
+Installing a handler and getting the delivery mechanism wrong leaves a process that
+ignores it.
+
+**Coordinates outside the declared range.** Controllers do report slightly past
+their logical maximum near the bezel. Unclamped, a touch on the right edge of a
+panel at `(-1920, 0)` mapped to `x = 72` — on the *other* display. The exact bug
+the tool exists to prevent, reachable from a single out-of-range report.
+
+**Assuming a logical minimum of zero.** The transform used `v / max`. Correct is
+`(v - min) / (max - min)`. The reference panel reports a minimum of 0, so this was
+invisible here — on a panel reporting `1000..17383` it puts the left edge 110 px
+off, decaying to 0 at the right edge, which reads exactly like a calibration fault.
+
+**One finger counted twice.** Contacts are keyed by HID collection. A panel that
+honours the Device Mode switch reports the same finger on both the digitizer and
+its mouse-emulation collection, which would make `downs.count` reach 2 and turn
+every tap into a scroll. The digitizer now wins whenever it is speaking. This would
+have hit the first person whose hardware supports multitouch — precisely the report
+CONTRIBUTING asks for.
+
+**Shared-mode fallback.** When seizing failed the tool used to continue without
+exclusive control. macOS then maps the panel its own wrong way *while* this process
+posts corrected events: every touch clicks twice, in two places. It now exits
+instead, which is also the better failure — launchd restarts the agent, so granting
+Input Monitoring makes it start working with no further action.
