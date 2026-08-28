@@ -272,6 +272,66 @@ Both grants are bound to the binary's cdhash. Rebuilding invalidates them, so
 contents differ. If you do rebuild, remove the old `touchmap` row from both lists
 and add it again — the stale row looks correct but grants nothing.
 
+## What this tool does not do
+
+Input Monitoring and Accessibility are the two most far-reaching permissions macOS
+grants. Between them they describe a keylogger. You should be suspicious of
+anything asking for both, including this — so here is exactly what it does with
+them, and how to check rather than take my word for it.
+
+**It does not touch the network.** No telemetry, no update check, no crash
+reporting. Nothing leaves your machine — and you do not have to trust that
+sentence, because it is checkable two ways.
+
+The binary does not link a single networking framework. No `CFNetwork`, no
+`Network.framework`, nothing that could open a socket:
+
+```bash
+otool -L /usr/local/bin/touchmap
+```
+
+You will see IOKit, CoreGraphics, ColorSync, ApplicationServices, Foundation and
+the Swift runtime. That is the complete list.
+
+And it holds no connections while running:
+
+```bash
+lsof -i -a -p "$(pgrep -x touchmap)"
+```
+
+That prints nothing. Not "nothing interesting" — no rows at all.
+
+**It does not read your keyboard.** Input Monitoring is what macOS requires to open
+*any* HID device. This one opens exactly one: the USB touch panel it matched by
+vendor and product ID. It never enumerates keyboards, never opens the built-in
+trackpad — which it explicitly excludes — and never installs a keyboard event tap.
+
+**It does not record what you do.** The log holds startup messages. Coordinates
+appear only when you pass `-v`, and raw HID reports only with `--debug`, both of
+which are diagnostic flags you invoke deliberately. Nothing is written anywhere
+else, ever.
+
+**It does not run as root.** It runs as you, from a LaunchAgent in your own home
+folder. It cannot modify the system even if it wanted to.
+
+**What it does do with Accessibility** is the honest part to be uneasy about: it
+synthesises mouse events, which land system-wide like any other click. That
+capability is the whole point of the tool, and there is no smaller permission that
+provides it. Every event it posts originates from a touch you made on the panel.
+
+**How to check for yourself:** it is one Swift file, no dependencies, no build
+system, no vendored code. The entire program is
+[`TouchMap.swift`](TouchMap.swift) — small enough to read end to end in a sitting,
+and `docs/INTERNALS.md` explains what every part of it is for. Compare the binary
+you installed against a build of your own:
+
+```bash
+shasum -a 256 /usr/local/bin/touchmap touchmap
+```
+
+Two identical hashes mean the running binary is exactly what the source compiles
+to.
+
 ## Gestures
 
 | Gesture | Events | Result |
@@ -313,6 +373,10 @@ there. [The full probe output and what it means](docs/INTERNALS.md#why-the-digit
 
 ```
 touchmap [options]
+
+SETUP
+  --status            Check installation, permissions and hardware, then exit
+  --version           Print the version and exit
 
 DEVICE
   --list-devices      List touchscreen-capable HID devices and exit
@@ -358,7 +422,7 @@ reports on whichever copy you ran. It tells you when those differ.
 | Worked before, stopped after rebuilding | New cdhash voided both grants | Remove and re-add `touchmap` in both permission lists |
 | `device is already held exclusively` | An older copy is still running | `pkill -x touchmap` then `touchmap --status` |
 | `no touchscreen found` | Panel not detected as a HID digitizer | `./touchmap --list-devices` |
-| Cursor lands on the wrong external screen | Wrong display picked | `./touchmap --list-displays`, then add `--display <uuid>` to the agent plist |
+| Cursor lands on the wrong external screen | Wrong display picked | `touchmap --list-displays`, then add `--display <uuid>` to the agent plist — see [Pinning a display](#pinning-a-display) |
 | `is not in the sudoers file` | Admin rights locked | [Work Macs](#work-macs-when-admin-rights-are-locked) |
 
 Full log: `/tmp/touchmap.log`. To watch gestures as you make them, stop the agent
@@ -374,6 +438,45 @@ Press Ctrl-C to stop, then start the agent again:
 ```bash
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/io.github.markstrom.touchmap.plist
 ```
+
+## Pinning a display
+
+With one external screen, auto-detection is right and there is nothing to do. With
+two or more, the tool takes the first external display it finds, which may not be
+the touch panel.
+
+Find the right UUID:
+
+```bash
+touchmap --list-displays
+```
+
+Then edit the agent and add the flag inside `ProgramArguments`:
+
+```bash
+open -e ~/Library/LaunchAgents/io.github.markstrom.touchmap.plist
+```
+
+```xml
+<key>ProgramArguments</key>
+<array>
+    <string>/usr/local/bin/touchmap</string>
+    <string>--display</string>
+    <string>F8025F1D-72E2-462F-8530-0F16BAC7BC1D</string>
+</array>
+```
+
+Each flag and each value is its own `<string>`. Then restart it:
+
+```bash
+launchctl kickstart -k gui/$UID/io.github.markstrom.touchmap
+```
+
+`install.sh` will not overwrite an agent you have edited — it keeps your version
+and says so. Use `./install.sh --reset-agent` if you want the default back.
+
+The same place is where you would add `--invert-scroll`, `--hold-time 0.3`, or
+`--scroll-scale 1.5` to make them permanent.
 
 ## Uninstalling
 
@@ -428,8 +531,13 @@ rather than assumed:
 
 ## Requirements
 
-macOS 13 or later, Xcode command line tools. Built and verified on macOS 26
-(Apple Silicon).
+Xcode command line tools, to compile the single source file.
+
+Developed and verified on **macOS 26, Apple Silicon**. The APIs it uses
+(`IOHIDCheckAccess`, `AXIsProcessTrusted`, `CGEvent`, the IOKit HID manager) have
+been available since macOS 10.15, so macOS 13 and later should work — but that is
+reasoning, not testing. If you run it on something older, a note in an issue would
+be genuinely useful.
 
 ## License
 

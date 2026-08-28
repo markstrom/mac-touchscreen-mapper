@@ -15,6 +15,7 @@ first job of this document is to let you check your own.
 - [The gesture state machine](#the-gesture-state-machine)
 - [Permissions: two TCC services](#permissions-two-tcc-services)
 - [launchd: why an agent and not a daemon](#launchd-why-an-agent-and-not-a-daemon)
+  - [The agent definition](#the-agent-definition)
 - [Error codes you will actually hit](#error-codes-you-will-actually-hit)
 - [Porting to another panel](#porting-to-another-panel)
 - [Known limitations](#known-limitations)
@@ -305,6 +306,25 @@ Since seizing needs Input Monitoring rather than root, a `LaunchAgent` in
 needs no admin rights at runtime, and it survives the user's admin privileges being
 revoked afterwards — which matters on managed hardware where admin is granted only
 temporarily.
+
+### The agent definition
+
+`install.sh` copies the repository's plist to
+`~/Library/LaunchAgents/io.github.markstrom.touchmap.plist`. The copy in the home
+folder is the live one; the repository holds the template.
+
+| Key | Effect |
+|---|---|
+| `Label` | The service's identity. This is the string in `launchctl kickstart -k gui/$UID/io.github.markstrom.touchmap` |
+| `ProgramArguments` | Argv. Bare by default, so both the panel and the display are auto-detected. Extra flags go here, one `<string>` per token |
+| `RunAtLoad` | Start at login. This is the autostart |
+| `KeepAlive` | Restart if the process exits. This is also what produces a restart loop when something else holds the device: the process dies on `kIOReturnExclusiveAccess`, launchd revives it, repeat |
+| `ProcessType` | `Interactive` keeps the scheduler from throttling it. Without it, touch response becomes uneven under load |
+| `StandardOutPath` / `StandardErrorPath` | `/tmp/touchmap.log`, which `--status` parses |
+
+Because `KeepAlive` masks a failing binary as a busy one, a crash loop looks like
+"running" in `pgrep` output. `launchctl print gui/$UID/io.github.markstrom.touchmap`
+shows the truth — watch the `runs` counter climb.
 
 ## Error codes you will actually hit
 
