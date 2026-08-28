@@ -307,7 +307,7 @@ sudo ./touchmap --probe-modes --debug
 
 If yours does honour the mode switch and starts sending report ID 13, two-finger
 scroll works: the code path for two or more simultaneous contacts is already
-there.
+there. [The full probe output and what it means](docs/INTERNALS.md#why-the-digitizer-stays-silent).
 
 ## Usage
 
@@ -395,15 +395,9 @@ Accessibility if you want to clean up completely.
 Display geometry is re-read automatically when displays are connected,
 disconnected, or change resolution.
 
-### Where the data actually comes from
-
-A panel typically exposes three HID collections: Mouse, TouchScreen digitizer,
-and something vendor-specific. On macOS the digitizer is usually **silent**.
-Windows touch panels start in mouse-emulation mode and only begin sending
-multitouch reports once the host writes to the `Device Configuration` feature
-report (report ID 33, Device Mode usage `0x52`). macOS never does this.
-
-So the data arrives on the Mouse collection instead, as absolute coordinates:
+One detail worth knowing even if you never read the code: the touch data does
+**not** arrive on the digitizer collection. That one is silent on macOS. It comes
+in on the panel's mouse-emulation collection as absolute coordinates:
 
 ```
 07 01 00 35 7C 0E 00
@@ -412,20 +406,25 @@ So the data arrives on the Mouse collection instead, as absolute coordinates:
 └ report ID
 ```
 
-Logical maxima are read from the HID elements themselves, so scaling is correct
-without hardcoding. Verified on the reference panel: a touch 5 px from the left
-edge produces an X fraction of 0.3 %, and all four corners map within one pixel.
+### Going deeper
 
-### Root is not required
+**[docs/INTERNALS.md](docs/INTERNALS.md)** documents the whole mechanism, measured
+rather than assumed:
 
-An earlier version installed a LaunchDaemon in `/Library/LaunchDaemons`. That runs
-as root outside the login session, where read-only CoreGraphics calls work
-(`CGDisplayBounds` returns correct values) but `CGEvent.post` does **not** — events
-never reach the desktop. The symptom is deceptive: seize succeeds, macOS's wrong
-mapping disappears, and touch stops doing anything whatsoever.
-
-Seizing needs Input Monitoring, not root privileges. A LaunchAgent in the user
-session gets both halves working and needs no admin rights at runtime.
+- The three HID collections, every report ID, and the exact byte layout
+- Why the digitizer never speaks, and how to test whether yours does
+- The three IOKit details that cost real debugging time — per-element callbacks,
+  collection cookies, relative-axis filtering
+- The coordinate transform, verified corner by corner
+- What seizing does, and what breaks without it
+- Why a click needs duration, and how `clickState` drives double-clicks
+- The gesture state machine, as a diagram
+- The two TCC services, how grants bind to a binary's cdhash, and why running from
+  Terminal hides a missing one
+- Why a LaunchDaemon cannot work, in detail
+- The two error codes you will actually hit
+- A step-by-step guide to porting this to another panel
+- Known limitations
 
 ## Requirements
 
