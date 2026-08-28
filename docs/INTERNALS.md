@@ -177,9 +177,31 @@ Within one pixel everywhere, using the panel's full logical range. No calibratio
 step is needed or offered.
 
 `CGDisplayBounds` returns points, not pixels, and already accounts for Retina
-scaling — do not apply a backing-scale factor. Geometry is re-read on
-`CGDisplayRegisterReconfigurationCallback`, so hot-plugging and resolution changes
-are handled without a restart.
+scaling — do not apply a backing-scale factor.
+
+Verified in all four arrangements, including a panel placed above the built-in
+display, where the origin's y goes negative:
+
+| Panel placed | Origin | Top-left maps to | Bottom-right maps to |
+|---|---|---|---|
+| Left | (−1920, 0) | −1920, 0 | 0, 1080 |
+| Right | (1680, 0) | 1680, 0 | 3600, 1080 |
+| Above | (0, −1080) | 0, −1080 | 1920, 0 |
+| Below | (0, 1050) | 0, 1050 | 1920, 2130 |
+
+**Do not cache the rectangle.** An earlier version stored it and refreshed from
+`CGDisplayRegisterReconfigurationCallback`. In a plain command line process that
+callback proved unreliable: dragging the panel to the other side in System
+Settings produced no notification at all — not even with the filter widened to
+every flag except `beginConfigurationFlag`. The cached rectangle kept pointing at
+where the display used to be, so touches landed on empty desktop, and the tool
+looked broken with nothing in the log to explain it.
+
+Only the display *id* is cached now. `CGDisplayBounds` is a cheap lookup that
+always reports the current position, so it is called on every touch and any
+rearrangement takes effect on the next one. The reconfiguration callback is kept
+only to invalidate the cached id, which matters when a display named by
+`--display` reconnects and is assigned a different one.
 
 ## Seizing the device
 

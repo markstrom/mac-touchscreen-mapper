@@ -495,8 +495,9 @@ Accessibility if you want to clean up completely.
    bounds, read from CoreGraphics
 4. Posts its own mouse and scroll events there
 
-Display geometry is re-read automatically when displays are connected,
-disconnected, or change resolution.
+The display's position is read fresh on every touch, so rearranging your screens
+takes effect immediately — no restart, no reconfiguration. Put the panel to the
+left, right, above or below; all four are verified.
 
 One detail worth knowing even if you never read the code: the touch data does
 **not** arrive on the digitizer collection. That one is silent on macOS. It comes

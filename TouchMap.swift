@@ -171,25 +171,53 @@ func resolveTarget() -> CGDirectDisplayID? {
     return all.first { CGDisplayIsBuiltin($0) == 0 }
 }
 
+/// Resolves the target display's bounds on demand.
+///
+/// An earlier version cached the rectangle and refreshed it from
+/// CGDisplayRegisterReconfigurationCallback. That callback proved unreliable in a
+/// plain command line process — dragging the panel to the other side in System
+/// Settings produced no notification at all, so the cached rectangle kept pointing
+/// at where the display used to be and touches landed on empty desktop.
+///
+/// Only the display *id* is cached now. CGDisplayBounds is a cheap lookup that
+/// always reports the current position, so any rearrangement is picked up on the
+/// very next touch with no notification needed.
 final class Target {
-    private(set) var bounds: CGRect = .zero
-    private(set) var ok = false
-    func refresh() {
-        if let id = resolveTarget() {
-            bounds = CGDisplayBounds(id); ok = true
-            log("display: \(displayUUID(id) ?? "?")  \(Int(bounds.width))x\(Int(bounds.height)) @ (\(Int(bounds.minX)),\(Int(bounds.minY)))")
-        } else {
-            ok = false
-            log("display: not found — touches ignored until it is connected")
-            // A typo in --display would otherwise wait forever in silence.
-            if optDisplayUUID != nil {
-                for id in onlineDisplays() {
-                    let b = CGDisplayBounds(id)
-                    log("  connected: \(displayUUID(id) ?? "?")  \(Int(b.width))x\(Int(b.height))")
+    private var id: CGDirectDisplayID?
+    private var logged = CGRect.null
+
+    func bounds() -> CGRect {
+        if id == nil { id = resolveTarget() }
+
+        var b = id.map { CGDisplayBounds($0) } ?? .null
+        if b.isEmpty || b.isNull {
+            // The display went away, or its id was recycled. Look again.
+            id = resolveTarget()
+            b = id.map { CGDisplayBounds($0) } ?? .null
+        }
+
+        if b != logged {
+            logged = b
+            if b.isEmpty || b.isNull {
+                log("display: not found — touches ignored until it is connected")
+                // A typo in --display would otherwise wait forever in silence.
+                if optDisplayUUID != nil {
+                    for d in onlineDisplays() {
+                        let db = CGDisplayBounds(d)
+                        log("  connected: \(displayUUID(d) ?? "?")  \(Int(db.width))x\(Int(db.height))")
+                    }
                 }
+            } else {
+                let uuid = id.flatMap { displayUUID($0) } ?? "?"
+                log("display: \(uuid)  \(Int(b.width))x\(Int(b.height)) @ (\(Int(b.minX)),\(Int(b.minY)))")
             }
         }
+        return b
     }
+
+    /// Force the id to be looked up again — the target may now be a different
+    /// display entirely, for instance when the one named by --display reconnects.
+    func invalidate() { id = nil }
 }
 let target = Target()
 
@@ -349,13 +377,14 @@ if let v = optVendor, let p = optProduct {
 log(String(format: "device: %@ (vendor 0x%04X, product 0x%04X)",
            deviceID.name, deviceID.vendor, deviceID.product))
 
-target.refresh()
+_ = target.bounds()   // resolve and log the target once at startup
 
+// Belt and braces. The bounds are read fresh on every touch anyway, so this only
+// forces the display *id* to be looked up again — which matters when the target
+// is named by --display and that display reconnects with a different id.
 CGDisplayRegisterReconfigurationCallback({ _, flags, _ in
-    if flags.contains(.setModeFlag) || flags.contains(.addFlag)
-        || flags.contains(.removeFlag) || flags.contains(.desktopShapeChangedFlag) {
-        target.refresh()
-    }
+    guard !flags.contains(.beginConfigurationFlag) else { return }
+    target.invalidate()
 }, nil)
 
 // ── Gesture state ────────────────────────────────────────────────────────────
@@ -427,8 +456,8 @@ func checkHold() {
 }
 
 func emit() {
-    guard target.ok else { return }
-    let b = target.bounds
+    let b = target.bounds()
+    guard !b.isEmpty, !b.isNull else { return }
 
     let downs = contacts.values.filter { $0.down && $0.hasPos }
 
