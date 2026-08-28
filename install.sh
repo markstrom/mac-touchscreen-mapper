@@ -43,4 +43,4 @@ launchctl bootstrap "gui/$UID" "$AGENT"
 
 echo "==> Done. Log: /tmp/touchmap.log"
 echo
-./status.sh || true
+"$BIN" --status || true
