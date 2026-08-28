@@ -1,24 +1,54 @@
 # mac-touchscreen-mapper
 
-Make an external USB touchscreen work on macOS: touches land on the panel you
-actually touched, instead of the corresponding spot on your laptop screen.
+## You connected an external touchscreen to your Mac. The picture works. The touch doesn't.
+
+You tap a button on the touch panel and nothing happens there — instead something
+gets clicked over on your laptop screen, in roughly the same spot. Drag a finger
+and you select text in a window you weren't even looking at. The panel works fine
+on a Windows machine, and the shop said it was plug-and-play.
+
+Sound familiar? That is what this tool fixes. Touches land where your finger
+actually is.
+
+It is not a broken panel, a bad cable, or a calibration you forgot to run. And
+there is no setting hidden in System Settings that turns it on — macOS has no
+touchscreen support at all, so there is nothing to switch on.
 
 Jump to [Installation](#installation) for step-by-step instructions. It takes
-about five minutes and assumes no prior command line experience.
+about five minutes and assumes no prior command line experience. Want to know
+first whether your screen is the right kind?
+[Check before installing anything](#will-my-screen-work-check-before-installing-anything).
 
-## The problem
+## Why it happens
 
-macOS has no touchscreen support at all. A USB touch panel enumerates as a HID
-device reporting *absolute* coordinates, and macOS maps those coordinates onto
-whichever display currently holds the cursor. Touch the external panel and the
-click lands on your built-in screen instead — at the matching relative position,
-which makes it look like a calibration bug rather than a mapping one.
+macOS has never supported touchscreens. It has no concept of "this panel is a
+touch surface located over there" — the notion does not exist in the system.
 
-The giveaway: touch works correctly *if the cursor already happens to be on the
-touch panel*, and goes somewhere else if it isn't.
+What it does have is support for *absolute pointing devices*, the category
+graphics tablets fall into. A USB touch panel enumerates as one of those: it
+reports "finger at 41% across, 11% down" rather than "cursor moved 3 pixels left".
+macOS accepts those coordinates but has to decide which screen they refer to, and
+it picks **whichever display the cursor happens to be on at that moment**.
 
-There is no macOS setting that fixes this. Making the panel the main display does
-not help, because the mapping follows the cursor, not the main display.
+Hence the behaviour that makes it look like a calibration fault rather than a
+mapping one: the position is right, the screen is wrong.
+
+The clearest way to recognise it: **touch works correctly whenever the cursor
+already happens to be sitting on the touch panel**, and goes somewhere else the
+rest of the time. If you have caught yourself nudging the cursor over to the touch
+screen first so that tapping works, this is your bug.
+
+Two things that seem like they should help, and don't:
+
+- **Making the panel the main display.** The mapping follows the cursor, not the
+  main display, so this changes nothing.
+- **Installing a driver from the monitor's maker.** These are almost always
+  Windows-only. The panel already speaks a standard protocol; nothing is missing
+  at the hardware end.
+
+This tool takes exclusive control of the panel so macOS stops guessing, then
+converts the coordinates against the target display's real position on your
+desktop and clicks there itself.
 
 ## Which displays this works with
 
