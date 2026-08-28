@@ -197,10 +197,26 @@ every flag except `beginConfigurationFlag`. The cached rectangle kept pointing a
 where the display used to be, so touches landed on empty desktop, and the tool
 looked broken with nothing in the log to explain it.
 
-Only the display *id* is cached now. `CGDisplayBounds` is a cheap lookup that
-always reports the current position, so it is called on every touch and any
-rearrangement takes effect on the next one. The reconfiguration callback is kept
-only to invalidate the cached id, which matters when a display named by
+**Look it up once per gesture instead.** `CGDisplayBounds` always reports the
+current position, so calling it when a gesture begins picks up any rearrangement
+on the very next touch — no notification required. A screen cannot be moved while
+a finger is already down, and holding the rectangle steady for the duration also
+stops a drag shifting under itself.
+
+Not per report, though. `CGDisplayBounds` is not the cheap accessor it looks like:
+
+```
+CGDisplayBounds:  11.4 µs per call   (M2, 1,000,000 iterations)
+```
+
+It is an IPC round trip to the window server, not a memory read. At the ~125
+reports per second a drag produces that is 0.14 % of a core — negligible in
+absolute terms, but 125× more work than the once-per-gesture version for no gain.
+The measurement is worth repeating if you change this; the intuition that it is
+free is wrong.
+
+Only the display *id* is cached across gestures. The reconfiguration callback
+survives solely to invalidate that id, which matters when a display named by
 `--display` reconnects and is assigned a different one.
 
 ## Seizing the device
