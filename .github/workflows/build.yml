@@ -1,0 +1,51 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swiftc --version
+
+      - name: Compile
+        run: swiftc -O -o touchmap TouchMap.swift
+
+      # No hardware and no TCC grants on a CI runner, so anything that opens the
+      # device or posts events cannot be exercised. These are the paths that run
+      # without either.
+      - name: Version and help
+        run: |
+          ./touchmap --version
+          ./touchmap --help
+
+      - name: Enumeration does not crash without hardware
+        run: |
+          ./touchmap --list-displays
+          ./touchmap --list-devices
+
+      - name: Argument validation rejects bad input
+        run: |
+          set +e
+          fail() { echo "expected failure: $*"; exit 1; }
+
+          ./touchmap --hold-time            2>/dev/null && fail "--hold-time with no value"
+          ./touchmap --scroll-scale abc     2>/dev/null && fail "--scroll-scale abc"
+          ./touchmap --vendor 0x27C0 --list-devices 2>/dev/null && fail "--vendor without --product"
+          ./touchmap --nonsense             2>/dev/null && fail "unknown flag"
+          echo "all rejected as expected"
+
+      - name: Shell scripts parse
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      - name: Property list is well formed
+        run: plutil -lint io.github.markstrom.touchmap.plist

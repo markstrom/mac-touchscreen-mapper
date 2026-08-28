@@ -529,6 +529,13 @@ rather than assumed:
 - A step-by-step guide to porting this to another panel
 - Known limitations
 
+## Contributing
+
+The most useful thing anyone can contribute is **a report from a panel I do not
+own** — everything here was measured on a single monitor. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for what to capture, and
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
 ## Requirements
 
 Xcode command line tools, to compile the single source file.

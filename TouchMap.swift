@@ -127,6 +127,13 @@ while let a = argIt.next() {
     }
 }
 
+// Validate combinations here, before any mode acts on them — otherwise a flag
+// error goes unreported whenever an early-exit mode such as --list-devices runs
+// first.
+if (optVendor == nil) != (optProduct == nil) {
+    die("--vendor and --product must be given together")
+}
+
 func log(_ s: String) { print(s); fflush(stdout) }
 func die(_ s: String) -> Never {
     FileHandle.standardError.write("error: \(s)\n".data(using: .utf8)!); exit(1)
@@ -323,9 +330,6 @@ if optStatus {
 
 // Resolve which panel to drive: explicit flags win, otherwise auto-detect.
 let deviceID: DeviceID
-if (optVendor == nil) != (optProduct == nil) {
-    die("--vendor and --product must be given together")
-}
 if let v = optVendor, let p = optProduct {
     deviceID = DeviceID(vendor: v, product: p, name: "specified on command line")
 } else {
