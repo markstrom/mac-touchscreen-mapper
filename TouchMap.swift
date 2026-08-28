@@ -13,6 +13,7 @@ import IOKit
 import IOKit.hid
 import CoreGraphics
 import ColorSync
+import ApplicationServices
 
 // HID usage constants.
 let kUsagePageGD        = 0x01   // Generic Desktop
@@ -37,6 +38,10 @@ var optVendor: Int? = nil
 var optProduct: Int? = nil
 var optListDisplays = false
 var optListDevices  = false
+var optStatus       = false
+
+let INSTALL_PATH = "/usr/local/bin/touchmap"
+let AGENT_LABEL  = "io.github.markstrom.touchmap"
 
 func parseID(_ s: String?) -> Int? {
     guard let s = s else { return nil }
@@ -60,12 +65,16 @@ while let a = argIt.next() {
     case "--product":       optProduct = parseID(argIt.next())
     case "--list-displays": optListDisplays = true
     case "--list-devices":  optListDevices = true
+    case "--status":        optStatus = true
     case "-h", "--help":
         print("""
         touchmap — map a USB HID touchscreen to the display it belongs to
 
         USAGE
           touchmap [options]
+
+        SETUP
+          --status            Check installation, permissions and hardware, then exit
 
         DEVICE
           --list-devices      List touchscreen-capable HID devices and exit
@@ -154,8 +163,12 @@ func deviceProp(_ d: IOHIDDevice, _ key: String) -> Int {
     (IOHIDDeviceGetProperty(d, key as CFString) as? Int) ?? -1
 }
 
-/// Any HID device whose primary usage says "touch screen". That is the class of
-/// panel this tool targets: the Windows-style USB HID digitizer.
+/// Any USB HID device whose primary usage says "touch screen". That is the class
+/// of panel this tool targets: the Windows-style USB HID digitizer.
+///
+/// The USB filter matters. A MacBook's built-in trackpad is also a digitizer with
+/// usage 0x04, reached over SPI. Without the transport check this tool could seize
+/// the trackpad and leave the machine without a pointing device.
 func findTouchDevices() -> [DeviceID] {
     let m = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
     IOHIDManagerSetDeviceMatching(m, [
@@ -167,6 +180,8 @@ func findTouchDevices() -> [DeviceID] {
     var seen = Set<String>()
     var out: [DeviceID] = []
     for d in set {
+        let transport = (IOHIDDeviceGetProperty(d, kIOHIDTransportKey as CFString) as? String) ?? ""
+        guard transport.caseInsensitiveCompare("USB") == .orderedSame else { continue }
         let v = deviceProp(d, kIOHIDVendorIDKey), p = deviceProp(d, kIOHIDProductIDKey)
         guard v > 0, p >= 0 else { continue }
         let key = "\(v):\(p)"
@@ -187,6 +202,92 @@ if optListDevices {
     for d in found {
         log(String(format: "vendor 0x%04X  product 0x%04X  %@", d.vendor, d.product, d.name))
     }
+    exit(0)
+}
+
+// ── Status ───────────────────────────────────────────────────────────────────
+/// Interrogate the system directly rather than inferring state from the log.
+/// IOHIDCheckAccess and AXIsProcessTrusted give definitive answers for the two
+/// permissions that this tool lives or dies by.
+func runningPIDs() -> [Int32] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    p.arguments = ["-x", "touchmap"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return [] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    let me = ProcessInfo.processInfo.processIdentifier
+    return String(decoding: data, as: UTF8.self)
+        .split(separator: "\n").compactMap { Int32($0) }.filter { $0 != me }
+}
+
+if optStatus {
+    let green = "\u{1B}[32m", red = "\u{1B}[31m", yellow = "\u{1B}[33m", off = "\u{1B}[0m"
+    func ok(_ s: String)   { log("  \(green)ok\(off)   \(s)") }
+    func bad(_ s: String)  { log("  \(red)fail\(off) \(s)") }
+    func warn(_ s: String) { log("  \(yellow)note\(off) \(s)") }
+
+    log("touchmap status")
+    log("")
+
+    let fm = FileManager.default
+    let agentPath = NSHomeDirectory() + "/Library/LaunchAgents/\(AGENT_LABEL).plist"
+
+    fm.isExecutableFile(atPath: INSTALL_PATH)
+        ? ok("binary installed: \(INSTALL_PATH)")
+        : bad("binary not installed at \(INSTALL_PATH) — run ./install.sh")
+
+    fm.fileExists(atPath: agentPath)
+        ? ok("starts automatically at login")
+        : bad("LaunchAgent not installed — run ./install.sh")
+
+    let pids = runningPIDs()
+    pids.isEmpty
+        ? bad("not running — launchctl kickstart -k gui/$UID/\(AGENT_LABEL)")
+        : ok("running (pid \(pids.map(String.init).joined(separator: " ")))")
+
+    // Permissions apply to the binary being executed, so say which one that is.
+    let self_ = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+    if self_ != INSTALL_PATH {
+        warn("checking THIS copy (\(self_)), not the installed one.")
+        warn("permissions are per-binary — run '\(INSTALL_PATH) --status' for the real answer.")
+    }
+
+    if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted {
+        ok("Input Monitoring granted — can read the panel")
+    } else {
+        bad("Input Monitoring NOT granted — the panel cannot be read")
+        log("       open \"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent\"")
+        log("       then add \(INSTALL_PATH)")
+    }
+
+    if AXIsProcessTrusted() {
+        ok("Accessibility granted — can move the cursor and click")
+    } else {
+        bad("Accessibility NOT granted — clicks go nowhere")
+        log("       open \"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility\"")
+        log("       then add \(INSTALL_PATH)")
+    }
+
+    let devices = findTouchDevices()
+    if let d = devices.first {
+        ok(String(format: "touchscreen: %@ (vendor 0x%04X, product 0x%04X)",
+                  d.name, d.vendor, d.product))
+        if devices.count > 1 { warn("\(devices.count) touchscreens present — first one is used") }
+    } else {
+        bad("no USB touchscreen found — is the panel plugged in?")
+    }
+
+    if let id = resolveTarget() {
+        let b = CGDisplayBounds(id)
+        ok("target display: \(Int(b.width))x\(Int(b.height)) @ (\(Int(b.minX)),\(Int(b.minY)))")
+    } else {
+        bad("no external display found")
+    }
+
     exit(0)
 }
 
