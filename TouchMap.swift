@@ -40,16 +40,37 @@ var optListDisplays = false
 var optListDevices  = false
 var optStatus       = false
 
+let VERSION      = "1.0.0"
 let INSTALL_PATH = "/usr/local/bin/touchmap"
 let AGENT_LABEL  = "io.github.markstrom.touchmap"
 
-func parseID(_ s: String?) -> Int? {
-    guard let s = s else { return nil }
-    if s.hasPrefix("0x") || s.hasPrefix("0X") { return Int(s.dropFirst(2), radix: 16) }
-    return Int(s)
+var argIt = CommandLine.arguments.dropFirst().makeIterator()
+
+/// A flag that takes a value must actually get one, and it must parse. Silently
+/// falling back to a default hides typos until someone wonders why --hold-time
+/// made no difference.
+func value(for flag: String) -> String {
+    guard let v = argIt.next(), !v.hasPrefix("--") else {
+        die("\(flag) needs a value")
+    }
+    return v
 }
 
-var argIt = CommandLine.arguments.dropFirst().makeIterator()
+func doubleValue(for flag: String) -> Double {
+    let s = value(for: flag)
+    guard let d = Double(s), d.isFinite else { die("\(flag): '\(s)' is not a number") }
+    return d
+}
+
+func idValue(for flag: String) -> Int {
+    let s = value(for: flag)
+    let parsed = (s.hasPrefix("0x") || s.hasPrefix("0X"))
+        ? Int(s.dropFirst(2), radix: 16)
+        : Int(s)
+    guard let v = parsed else { die("\(flag): '\(s)' is not a number (use 1234 or 0x04D2)") }
+    return v
+}
+
 while let a = argIt.next() {
     switch a {
     case "--no-seize":      optSeize = false
@@ -58,14 +79,15 @@ while let a = argIt.next() {
     case "--multitouch":    optMultitouch = true
     case "--probe-modes":   optProbeModes = true; optMultitouch = true
     case "--invert-scroll": optInvertScroll = true
-    case "--scroll-scale":  optScrollScale = Double(argIt.next() ?? "1") ?? 1.0
-    case "--hold-time":     optHoldTime = Double(argIt.next() ?? "0.5") ?? 0.5
-    case "--display":       optDisplayUUID = argIt.next()
-    case "--vendor":        optVendor = parseID(argIt.next())
-    case "--product":       optProduct = parseID(argIt.next())
+    case "--scroll-scale":  optScrollScale = doubleValue(for: a)
+    case "--hold-time":     optHoldTime = doubleValue(for: a)
+    case "--display":       optDisplayUUID = value(for: a)
+    case "--vendor":        optVendor = idValue(for: a)
+    case "--product":       optProduct = idValue(for: a)
     case "--list-displays": optListDisplays = true
     case "--list-devices":  optListDevices = true
     case "--status":        optStatus = true
+    case "--version":       print("touchmap \(VERSION)"); exit(0)
     case "-h", "--help":
         print("""
         touchmap — map a USB HID touchscreen to the display it belongs to
@@ -75,6 +97,7 @@ while let a = argIt.next() {
 
         SETUP
           --status            Check installation, permissions and hardware, then exit
+          --version           Print the version and exit
 
         DEVICE
           --list-devices      List touchscreen-capable HID devices and exit
@@ -151,6 +174,13 @@ final class Target {
         } else {
             ok = false
             log("display: not found — touches ignored until it is connected")
+            // A typo in --display would otherwise wait forever in silence.
+            if optDisplayUUID != nil {
+                for id in onlineDisplays() {
+                    let b = CGDisplayBounds(id)
+                    log("  connected: \(displayUUID(id) ?? "?")  \(Int(b.width))x\(Int(b.height))")
+                }
+            }
         }
     }
 }
@@ -293,6 +323,9 @@ if optStatus {
 
 // Resolve which panel to drive: explicit flags win, otherwise auto-detect.
 let deviceID: DeviceID
+if (optVendor == nil) != (optProduct == nil) {
+    die("--vendor and --product must be given together")
+}
 if let v = optVendor, let p = optProduct {
     deviceID = DeviceID(vendor: v, product: p, name: "specified on command line")
 } else {
@@ -442,14 +475,15 @@ func emit() {
         if optVerbose { log("down  \(Int(p.x)),\(Int(p.y))  click=\(clickState)") }
 
     case .pending:
+        // The button is already down, so the event is the same either way; passing
+        // MOVE_SLOP only decides that this is a drag and not a candidate for the
+        // hold-to-scroll timer.
         lastPt = p
         if hypot(p.x - touchStart.x, p.y - touchStart.y) > MOVE_SLOP {
             phase = .dragging
-            post(.leftMouseDragged, p)
             if optVerbose { log("drag  \(Int(p.x)),\(Int(p.y))") }
-        } else {
-            post(.leftMouseDragged, p)
         }
+        post(.leftMouseDragged, p)
 
     case .dragging:
         lastPt = p

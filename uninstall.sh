@@ -9,5 +9,7 @@ if [ -e /usr/local/bin/touchmap ]; then
     sudo rm -f /usr/local/bin/touchmap
 fi
 
+rm -f /tmp/touchmap.log
+
 echo "Uninstalled."
 echo "You may also want to remove touchmap from Input Monitoring and Accessibility."

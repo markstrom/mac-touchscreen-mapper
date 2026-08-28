@@ -14,6 +14,17 @@ AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
 # Only rebuild when the source actually changed. A needless rebuild produces a new
 # cdhash, which silently invalidates both TCC grants.
 if [ ! -x touchmap ] || [ TouchMap.swift -nt touchmap ]; then
+    if ! command -v swiftc >/dev/null 2>&1; then
+        echo "error: swiftc not found." >&2
+        echo >&2
+        echo "touchmap is compiled on your machine and needs Apple's command line" >&2
+        echo "tools. They ship free with macOS but are not installed by default:" >&2
+        echo >&2
+        echo "    xcode-select --install" >&2
+        echo >&2
+        echo "Click Install in the dialog, wait for it to finish, then run this again." >&2
+        exit 1
+    fi
     echo "==> Building"
     swiftc -O -o touchmap TouchMap.swift
 else
@@ -36,7 +47,21 @@ fi
 
 echo "==> Installing LaunchAgent"
 mkdir -p "$HOME/Library/LaunchAgents"
-cp "$LABEL.plist" "$AGENT"
+
+# Never clobber a customised agent. The README tells people to add flags such as
+# --display <uuid> here, and overwriting on every install would silently undo it.
+if [ -f "$AGENT" ] && ! diff -q "$LABEL.plist" "$AGENT" >/dev/null 2>&1; then
+    if [ "$1" = "--reset-agent" ]; then
+        echo "    replacing your customised agent (--reset-agent)"
+        cp "$LABEL.plist" "$AGENT"
+    else
+        echo "    keeping your customised agent at:"
+        echo "      $AGENT"
+        echo "    run ./install.sh --reset-agent to replace it with the default"
+    fi
+else
+    cp "$LABEL.plist" "$AGENT"
+fi
 
 launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$UID" "$AGENT"
