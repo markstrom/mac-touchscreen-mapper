@@ -45,10 +45,34 @@ HID protocol. The tool auto-detects the panel; nothing is hardcoded.
 **Not supported:** panels requiring a vendor driver, or touch delivered over
 anything other than USB HID.
 
-Check yours:
+### Will my screen work? Check before installing anything
+
+Paste this into Terminal. It uses only tools already on your Mac — nothing to
+download, nothing to build:
 
 ```bash
-./touchmap --list-devices
+ioreg -r -c IOHIDDevice -d 1 | awk 'BEGIN{RS="\\+-o"} /"PrimaryUsagePage" = 13/ && /"PrimaryUsage" = 4\n/ && /"Transport" = "USB"/ {n="unnamed"; if (match($0,/"Product" = "[^"]*"/)) n=substr($0,RSTART+13,RLENGTH-14); print "compatible touchscreen: " n}'
+```
+
+With the panel plugged in, a compatible screen prints something like:
+
+```
+compatible touchscreen: TouchScreen
+```
+
+No output means macOS does not see a USB HID touchscreen. Check that the panel's
+USB cable is connected — on many portable monitors the touch signal travels over a
+*different* cable than the video, so the picture can work while touch does not.
+
+The `"Transport" = "USB"` filter matters: a MacBook's built-in trackpad is also a
+digitizer with usage `0x04`, but it is reached over SPI. Without that filter the
+check reports the trackpad and gives a false positive.
+
+After installing you can use the tool's own version, which also shows vendor and
+product IDs:
+
+```bash
+touchmap --list-devices
 ```
 
 ## Installation
@@ -137,21 +161,29 @@ switch **on**.
 ### Step 5 — Restart and verify
 
 ```bash
-launchctl kickstart -k gui/$UID/io.github.markstrom.touchmap && ./status.sh
+launchctl kickstart -k gui/$UID/io.github.markstrom.touchmap && touchmap --status
 ```
 
-You want to see:
+Every line should say `ok`:
 
 ```
-ok   exclusive control of the panel (Input Monitoring granted)
+touchmap status
+
+  ok   binary installed: /usr/local/bin/touchmap
+  ok   starts automatically at login
+  ok   running (pid 20732)
+  ok   Input Monitoring granted — can read the panel
+  ok   Accessibility granted — can move the cursor and click
+  ok   touchscreen: TouchScreen (vendor 0x27C0, product 0x0859)
+  ok   target display: 1920x1080 @ (-1920,0)
 ```
 
 Now touch your external screen. The cursor should land exactly where your finger
 is. **You're done** — it starts by itself every time you log in, and needs no
 admin rights to run.
 
-If something is off, `./status.sh` names the missing piece and prints the command
-that fixes it. Run it any time.
+If something is off, `touchmap --status` names the missing piece and prints the
+command that fixes it. Run it any time, from any folder.
 
 ### Work Macs: when admin rights are locked
 
@@ -276,19 +308,25 @@ DIAGNOSTICS
 
 ## Troubleshooting
 
-Start here. It checks the binary, the agent, the hash and the seize state, and
-prints the exact command for whatever is missing:
+Start here. It asks the system directly about every prerequisite — installation,
+both permissions, the panel, the display — and prints the exact command for
+whatever is missing:
 
 ```bash
-./status.sh
+touchmap --status
 ```
+
+Before installing, run it from the project folder as `./touchmap --status`. Note
+that permissions are granted per binary: a copy in your Downloads folder and the
+installed one at `/usr/local/bin/touchmap` have separate grants, and the check
+reports on whichever copy you ran. It tells you when those differ.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Touch still clicks on the laptop screen | The tool isn't running, or Input Monitoring is missing | `./status.sh` |
+| Touch still clicks on the laptop screen | The tool isn't running, or Input Monitoring is missing | `touchmap --status` |
 | Touch does **nothing at all** | Accessibility missing — the tool reads the panel but its clicks go nowhere | [Step 4](#step-4--grant-accessibility) |
 | Worked before, stopped after rebuilding | New cdhash voided both grants | Remove and re-add `touchmap` in both permission lists |
-| `device is already held exclusively` | An older copy is still running | `pkill -x touchmap` then `./status.sh` |
+| `device is already held exclusively` | An older copy is still running | `pkill -x touchmap` then `touchmap --status` |
 | `no touchscreen found` | Panel not detected as a HID digitizer | `./touchmap --list-devices` |
 | Cursor lands on the wrong external screen | Wrong display picked | `./touchmap --list-displays`, then add `--display <uuid>` to the agent plist |
 | `is not in the sudoers file` | Admin rights locked | [Work Macs](#work-macs-when-admin-rights-are-locked) |
